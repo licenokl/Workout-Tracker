@@ -5,6 +5,11 @@ from jose import JWTError, jwt
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.orm import Session
+from database import engine, SessionLocal
+from models import User, Workout, Base
+
+Base.metadata.create_all(bind=engine)
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
@@ -14,8 +19,12 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-users_db = {}
-workout_db = {}
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 app = FastAPI()
 
@@ -34,6 +43,12 @@ class Token(BaseModel):
 class WorkoutCreate(BaseModel):
     name: str
     date: Optional[str] = None
+
+class WorkoutOut(BaseModel):
+    id: int
+    name: str
+    date: Optional[str]
+    owner_email: str
 
 def hash_password(password: str) -> str:
     return pwd_context.hash(password[:72])
@@ -66,9 +81,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
     return email
 
-
-
-
 @app.get("/ping")
 def ping():
     return {"ok": True}
@@ -78,66 +90,72 @@ def home():
     return {"message": "Hello! Server is running"}
 
 @app.post("/auth/register")
-def register(user: UserRegister):
-    if user.email in users_db:
+def register(user: UserRegister, db:Session = Depends(get_db)):
+    existing_user = db.query(User).filter(User.email == user.email).first()
+    if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
-    users_db[user.email] = hash_password(user.password)
+
+    hashed_pw = hash_password(user.password)
+    db_user = User(email=user.email, hashed_password=hashed_pw)
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+
     return {"message": f"User {user.email} is registered"}
 
 @app.post("/auth/login", response_model=Token)
-def login(user: UserLogin):
-    if user.email not in users_db:
+def login(user: UserLogin, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.email == user.email).first()
+    if not db_user:
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    stored_hash = users_db[user.email]
-    if not verify_password(user.password, stored_hash):
+
+    if not verify_password(user.password, db_user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user.email}, expires_delta=access_token_expires
+        data={"sub": db_user.email}, expires_delta=access_token_expires
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/workouts")
 def create_workout(
         workout: WorkoutCreate,
-        current_user_email: str = Depends(get_current_user)
+        current_user_email: str = Depends(get_current_user),
+        db: Session = Depends(get_db)
 ):
-    if current_user_email not in workout_db:
-        workout_db[current_user_email] = []
+    db_workout = Workout(
+        name=workout.name,
+        date=workout.date,
+        owner_email=current_user_email
+    )
+    db.add(db_workout)
+    db.commit()
+    db.refresh(db_workout)
 
-    new_workout = {
-        "id": len(workout_db[current_user_email]) + 1,
-        "name": workout.name,
-        "date": workout.date,
-        "created_at": datetime.now(timezone.utc).isoformat()
+    return {
+        "message": "Workout created",
+        "workout": {
+            "id": db_workout.id,
+            "name": db_workout.name,
+            "date": db_workout.date,
+            "owner_email": db_workout.owner_email
+        }
     }
-    workout_db[current_user_email].append(new_workout)
 
-    return {"message": "Workout created", "workout": new_workout}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+@app.get("/workouts")
+def get_workouts(
+    current_user_email: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    workouts = db.query(Workout).filter(Workout.owner_email == current_user_email).all()
+    workout_list = [
+        {
+            "id": w.id,
+            "name": w.name,
+            "date": w.date,
+            "owner_email": w.onwer_email
+        }
+        for w in workouts
+    ]
+    return {"workouts": workout_list}
